@@ -121,13 +121,23 @@ if submit:
                         try:
                             client = PostmarkClient(server_token=token)
                             
+                            # Convert Streamlit UploadedFile objects into Postmark-friendly dicts
+                            pm_attachments = []
+                            for up in all_files:
+                                raw = up.getvalue()  # bytes
+                                pm_attachments.append({
+                                    "Name": up.name,
+                                    "Content": base64.b64encode(raw).decode("ascii"),
+                                    "ContentType": up.type or "application/octet-stream"
+                                })
+                            
                             # Send Email
                             response = client.emails.send(
                                 From=TARGET_EMAIL,
                                 To=TARGET_EMAIL,
                                 Subject="🏆 New Submission Received for MD’s Awards",
                                 HtmlBody=email_body,
-                                Attachments=all_files  # Attach files here
+                                Attachments=pm_attachments
                             )
                             
                             st.success("✅ Submission successful! Your performance will be reviewed shortly.")
