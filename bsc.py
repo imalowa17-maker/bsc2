@@ -1,16 +1,13 @@
 import streamlit as st
-import smtplib
 import os
-from email.message import EmailMessage
+from postmarker.core import PostmarkClient
 
 # --- CONFIGURATION ---
-# This pulls the 'Secret' you named EMAIL_PASSWORD from GitHub
-EMAIL_PASS = os.getenv("EMAIL_PASSWORD") 
+# Ensure 'POSTMARK_API_TOKEN' is added to Streamlit/GitHub Secrets
+POSTMARK_API_TOKEN = os.getenv("POSTMARK_API_TOKEN")
 TARGET_EMAIL = "busdev3@securico.co.zw"
-SMTP_SERVER = "smtp.office365.com"
-SMTP_PORT = 587
 
-st.set_page_config(page_title="MD's Quality Awards", layout="wide")
+st.set_page_config(page_title="SecuriEx", page_icon="🏆", layout="wide")
 st.title("🏆 MD’S Quality & Excellence Awards")
 
 # 1. Identity Fields
@@ -39,33 +36,30 @@ with st.form("bsc_form"):
         action = st.text_area(f"Describe Action Taken ({p})", key=f"text_{p}")
         attachments = st.file_uploader(f"Attach evidence for {p}", 
                                        accept_multiple_files=True, 
-                                       type=["pdf", "png", "jpg", "docx"],
                                        key=f"file_{p}")
         
         user_data[p] = {"action": action, "files": attachments}
         st.divider()
 
-    # 2. Submission Button
     submit = st.form_submit_button("Submit Performance for Evaluation")
 
 if submit:
     if not first_name or not last_name:
-        st.error("Please provide your Name and Surname before submitting.")
-    elif not EMAIL_PASS:
-        st.error("Email configuration missing. Please ensure EMAIL_PASSWORD is set in GitHub Secrets.")
+        st.error("Please provide your Name and Surname.")
+    elif not POSTMARK_API_TOKEN:
+        st.error("Postmark API Token missing. Please check your Secrets settings.")
     else:
         # --- AI ANALYSIS (RUNNING IN BACKGROUND) ---
         email_body = f"MD'S QUALITY AWARDS SUBMISSION\n"
         email_body += f"Submitted by: {first_name} {last_name}\n"
         email_body += "="*40 + "\n\n"
         
-        all_attachments = []
+        postmark_attachments = []
 
         for p, data in user_data.items():
             action_text = data["action"]
             file_list = data["files"]
             file_count = len(file_list)
-            all_attachments.extend(file_list)
 
             # AI Calculation Logic
             base_confidence = 70 if len(action_text) > 100 else 40
@@ -79,35 +73,40 @@ if submit:
                 rating = "No Data"
                 score = 0
 
-            # Add analysis to the email body (not shown on screen)
+            # Building the Email Report
             email_body += f"PERSPECTIVE: {p}\n"
-            email_body += f"Action: {action_text}\n"
+            email_body += f"Action Taken: {action_text}\n"
             email_body += f"AI Rating: {rating}\n"
-            email_body += f"AI Confidence Score: {score}%\n"
-            email_body += f"Evidence provided: {file_count} files\n"
+            email_body += f"Confidence Score: {score}%\n"
+            email_body += f"Evidence: {file_count} files provided\n"
             email_body += "-"*20 + "\n\n"
 
-        # --- SENDING THE EMAIL ---
-        with st.spinner("Uploading evidence and sending analysis..."):
-            msg = EmailMessage()
-            msg['Subject'] = f"Award Submission: {first_name} {last_name}"
-            msg['From'] = TARGET_EMAIL
-            msg['To'] = TARGET_EMAIL
-            msg.set_content(email_body)
-
-            for f in all_attachments:
+            # Adding attachments to the list
+            for f in file_list:
                 f.seek(0)
-                msg.add_attachment(f.read(), maintype='application', 
-                                   subtype='octet-stream', filename=f.name)
+                postmark_attachments.append({
+                    "Name": f.name,
+                    "Content": f.read(),
+                    "ContentType": f.type
+                })
 
+        # --- SENDING VIA POSTMARK ---
+        with st.spinner("Submitting to MD's office..."):
             try:
-                with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-                    server.starttls()
-                    server.login(TARGET_EMAIL, EMAIL_PASS)
-                    server.send_message(msg)
+                # Initialize Postmark Client
+                postmark = PostmarkClient(server_token=POSTMARK_API_TOKEN)
                 
-                # Success message to user (without showing marks)
+                # Send Email
+                postmark.emails.send(
+                    From=TARGET_EMAIL, # This must be verified in Postmark
+                    To=TARGET_EMAIL,
+                    Subject=f"New Award Submission: {first_name} {last_name}",
+                    TextBody=email_body,
+                    Attachments=postmark_attachments
+                )
+                
                 st.balloons()
-                st.success(f"Thank you, {first_name}! Your submission has been sent to the MD's office for review.")
+                st.success(f"Successfully submitted! Thank you, {first_name}.")
             except Exception as e:
-                st.error(f"Error sending email: {e}")
+                st.error(f"Postmark Error: {e}")
+                st.info("Ensure busdev3@securico.co.zw is verified in your Postmark Sender Signatures.")
