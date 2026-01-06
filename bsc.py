@@ -24,6 +24,39 @@ def get_postmark_token():
         raise RuntimeError("POSTMARK_API_TOKEN is not set. Set it as an environment variable or create a .env file with POSTMARK_API_TOKEN=your-token. Example (PowerShell): $env:POSTMARK_API_TOKEN='your-token'")
     return token
 
+
+def score_perspective(action_text, files, keywords):
+    """Return a score (0-25) for the given action_text and list of UploadedFile-like objects.
+    Scoring is based on keyword relevance (up to 15 pts) and length (up to 10 pts).
+    If the action is >200 chars and there are 2+ attachments, apply a small extra-mile boost (up to +3 within the 25 cap).
+    """
+    text = (action_text or "").lower()
+    if not text:
+        return 0.0
+
+    # Keyword relevance (scale to 0-15 pts)
+    matches = 0
+    for kw in keywords:
+        if kw.lower() in text:
+            matches += 1
+    keyword_points = min(matches, 5) / 5.0 * 15.0  # up to 15 points
+
+    # Length score (scale to 0-10 pts, target 300 chars)
+    length_points = min(len(text), 300) / 300.0 * 10.0
+
+    score = keyword_points + length_points
+
+    # Extra mile: if long description and 2+ attachments, give a small boost within the 25-point cap
+    try:
+        num_files = len(files) if files else 0
+    except Exception:
+        num_files = 0
+
+    if len(text) > 200 and num_files >= 2:
+        score = min(25.0, score + 3.0)
+
+    return round(min(25.0, score), 1)
+
 # Token will be loaded at runtime via get_postmark_token(). Never embed secrets in source control.
 POSTMARK_API_TOKEN = None
 TARGET_EMAIL = "busdev3@securico.co.zw"
@@ -96,64 +129,108 @@ if submit:
         except RuntimeError as e:
             st.error(f"⚠️ System Config Error: {e}")
         else:
-                # Using a Status Container for "Interesting" visual feedback
-                with st.status("🧠 AI Performance Analysis in Progress...", expanded=True) as status:
+                # Using a Status Container for silent finalization feedback
+                with st.status("Finalizing submission...", expanded=True) as status:
                 
+                    # Compute scores for each perspective
+                    score_breakdown = {}
+                    all_files = []
+
+                    keyword_map = {
+                        "Financial": ["revenue", "cost", "profit", "margin", "budget", "pricing", "savings", "income", "expense"],
+                        "Customer": ["customer", "client", "satisfaction", "retention", "feedback", "complaint", "loyalty", "support", "nps"],
+                        "Internal Business Processes": ["process", "efficien", "compliance", "safety", "audit", "quality", "procedure", "automation", "sheq"],
+                        "Learning & Growth": ["train", "develop", "workshop", "ment", "competenc", "engag", "learning", "upskill", "coaching"]
+                    }
+
+                    for p, data in user_data.items():
+                        action_text = (data.get("action") or "").strip()
+                        files = data.get("files") or []
+                        kw = keyword_map.get(p, [])
+                        score = score_perspective(action_text, files, kw)
+                        score_breakdown[p] = score
+
+                        # collect files
+                        if files:
+                            for file in files:
+                                all_files.append(file)
+                    
+                    total_score = sum(score_breakdown.values())
+
+                    # Build email body including the score breakdown
+                    breakdown_lines = "\n".join([f"**{p}:** {score:.1f} / 25" for p, score in score_breakdown.items()])
                     email_body = f"""
                     **MD’S Quality & Excellence Awards Submission**
 
                     **Name:** {first_name} {last_name}
 
                     ---
+                    **Score Breakdown (per perspective):**
+                    {breakdown_lines}
+
+                    **Total Score:** {total_score:.1f} / 100
 
                     """
-                    # Attachments
-                    all_files = []
-                    for p, data in user_data.items():
-                        files = data["files"]
-                        if files:
-                            for file in files:
-                                all_files.append(file)
-                    
-                    # If there's any file, proceed to upload
-                    if all_files:
-                        # --- POSTMARK EMAIL LOGIC ---
-                        try:
-                            client = PostmarkClient(server_token=token)
-                            
-                            # Convert Streamlit UploadedFile objects into Postmark-friendly dicts
-                            pm_attachments = []
-                            for up in all_files:
-                                raw = up.getvalue()  # bytes
-                                pm_attachments.append({
-                                    "Name": up.name,
-                                    "Content": base64.b64encode(raw).decode("ascii"),
-                                    "ContentType": up.type or "application/octet-stream"
-                                })
-                            
-                            # Send Email
-                            response = client.emails.send(
-                                From=TARGET_EMAIL,
-                                To=TARGET_EMAIL,
-                                Subject="🏆 New Submission Received for MD’s Awards",
-                                HtmlBody=email_body,
-                                Attachments=pm_attachments
-                            )
-                            
-                            st.success("✅ Submission successful! Your performance will be reviewed shortly.")
-                        except Exception as e:
-                            st.error(f"⚠️ Error in submission: {str(e)}")
-                    else:
-                        st.warning("No files attached. Please upload evidence files.")
+
+                    # --- POSTMARK EMAIL LOGIC ---
+                    try:
+                        client = PostmarkClient(server_token=token)
+                        
+                        # Convert Streamlit UploadedFile objects into Postmark-friendly dicts
+                        pm_attachments = []
+                        for up in all_files:
+                            raw = up.getvalue()  # bytes
+                            pm_attachments.append({
+                                "Name": up.name,
+                                "Content": base64.b64encode(raw).decode("ascii"),
+                                "ContentType": up.type or "application/octet-stream"
+                            })
+                        
+                        # Send Email (attachments optional)
+                        response = client.emails.send(
+                            From=TARGET_EMAIL,
+                            To=TARGET_EMAIL,
+                            Subject="🏆 New Submission Received for MD’s Awards",
+                            HtmlBody=email_body,
+                            Attachments=pm_attachments
+                        )
+                        
+                        st.success("✅ Submission successful! Your performance will be reviewed shortly.")
+                    except Exception as e:
+                        st.error(f"⚠️ Error in submission: {str(e)}")
     # your main logic
     pass
 
 def compute(a, b):
     return a + b
 
+
 def test_compute_basic():
     expected_value = 5
     assert compute(2, 3) == expected_value
+
+
+def test_score_empty():
+    assert score_perspective("", [], []) == 0.0
+
+
+def test_score_keywords_and_length():
+    kw = ["revenue", "budget"]
+    action = "We increased revenue and reduced budget spend significantly to improve margins."
+    score = score_perspective(action, [], kw)
+    assert score > 0
+    assert score <= 25
+
+
+def test_extra_mile_bonus():
+    kw = ["training"]
+    short_score = score_perspective("Short training note", [], kw)
+    long_action = "x" * 210 + " training program to upskill staff"
+    # simulate attachments
+    attachments = [object(), object()]
+    long_score = score_perspective(long_action, attachments, kw)
+    assert long_score >= short_score
+
 
 def main(args):
     logging.info(f"Running with input: {args.input}")
