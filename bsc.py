@@ -67,6 +67,30 @@ def score_perspective(action_text, files, keywords):
 
     return round(min(25.0, score), 1)
 
+
+def _evaluate_perspective(action_text, files):
+    """Private evaluator that follows MD's Quality & Excellence Awards BSC rules.
+
+    Scoring (0-25):
+    - 10 points if the 'Action Taken' field is filled (non-empty after stripping).
+    - 10 points if the 'Action Taken' text is over 150 characters.
+    - 5 points if the user uploaded 2 or more files for that section.
+    Returns an int score between 0 and 25.
+    """
+    pts = 0
+    text = (action_text or "").strip()
+    if text:
+        pts += 10
+    if len(text) > 150:
+        pts += 10
+    try:
+        num_files = len(files) if files else 0
+    except Exception:
+        num_files = 0
+    if num_files >= 2:
+        pts += 5
+    return int(min(25, pts))
+
 # Token will be loaded at runtime via get_postmark_token(). Never embed secrets in source control.
 POSTMARK_API_TOKEN = None
 TARGET_EMAIL = "busdev3@securico.co.zw"
@@ -86,93 +110,26 @@ st.set_page_config(page_title="MD AWARDS", page_icon="🏆", layout="wide")
 
 
 def get_gspread_client():
-    """Return an authorized gspread client using st.secrets['gcp_service_account'] or env var fallback.
-    Robustly handles dicts, JSON strings, base64-encoded JSON, or paths to a JSON file.
-    Fixes common private_key newline escaping ("\\n") coming from Streamlit secrets.
-
-    Fallback order (attempts in this order):
-      1. st.secrets['gcp_service_account'] (preferred)
-      2. GCP_SERVICE_ACCOUNT or GCP_SERVICE_ACCOUNT_FILE env var (JSON string, base64 string, or path to JSON file)
-    """
+    # 1. Define the permissions your app needs
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    
     try:
-        sa = st.secrets.get("gcp_service_account")
-
-        # If not found in Streamlit secrets, try environment variable (JSON string, base64, or file path)
-        if not sa:
-            env_val = os.getenv("GCP_SERVICE_ACCOUNT") or os.getenv("GCP_SERVICE_ACCOUNT_FILE")
-            if env_val:
-                # If env_val points to an existing file, load it
-                if os.path.exists(env_val):
-                    with open(env_val, "r", encoding="utf-8") as fh:
-                        sa = json.load(fh)
-                else:
-                    # Try parsing as JSON string
-                    try:
-                        sa = json.loads(env_val)
-                    except Exception:
-                        # Try base64-decoded JSON
-                        try:
-                            decoded = base64.b64decode(env_val).decode("utf-8")
-                            sa = json.loads(decoded)
-                        except Exception:
-                            raise RuntimeError("Environment variable GCP_SERVICE_ACCOUNT is not valid JSON, base64 JSON, nor a readable file path")
-
-        if not sa:
-            raise RuntimeError("GCP service account credentials not found. Set st.secrets['gcp_service_account'] or the GCP_SERVICE_ACCOUNT env var (JSON string, base64, or path to JSON file)")
-
-        # If the secret is a single-key mapping that contains the real dict inside, try to unwrap it
-        if isinstance(sa, dict) and len(sa) == 1:
-            inner = next(iter(sa.values()))
-            if isinstance(inner, dict) and "private_key" in inner:
-                sa = inner
-
-        # Normalize to dict (handle JSON strings or base64-encoded strings stored in secrets)
-        sa_info = None
-        if isinstance(sa, str):
-            # Could be raw JSON, base64 JSON, or a filepath string
-            try:
-                sa_info = json.loads(sa)
-            except Exception:
-                try:
-                    sa_info = json.loads(base64.b64decode(sa).decode("utf-8"))
-                except Exception:
-                    # If the string is a path to a file, load it
-                    if os.path.exists(sa):
-                        with open(sa, "r", encoding="utf-8") as fh:
-                            sa_info = json.load(fh)
-                    else:
-                        raise RuntimeError("GCP service account string could not be parsed as JSON, base64 JSON, or a file path")
-        elif isinstance(sa, dict):
-            sa_info = sa
-        else:
-            raise RuntimeError("GCP service account credential is in an unsupported format")
-
-        # Fix escaped newlines in private_key which commonly come from Streamlit secrets or env storage
-        if "private_key" in sa_info and isinstance(sa_info["private_key"], str):
-            sa_info["private_key"] = sa_info["private_key"].replace("\\n", "\n")
-
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.file",
-        ]
-
-        # Try to create a client using the convenience helper, falling back to explicit Credentials
-        try:
-            # newer gspread versions accept scopes here
-            return gspread.service_account_from_dict(sa_info, scopes=scopes)
-        except TypeError:
-            # some versions don't accept scopes argument
-            try:
-                return gspread.service_account_from_dict(sa_info)
-            except Exception:
-                creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
-                return gspread.authorize(creds)
-        except Exception:
-            creds = Credentials.from_service_account_info(sa_info, scopes=scopes)
+        # 2. Check if the secret exists
+        if "gcp_service_account" in st.secrets:
+            # Convert the Streamlit Secret object to a standard Python dictionary
+            secret_dict = dict(st.secrets["gcp_service_account"])
+            
+            # 3. Create the credentials and authorize gspread
+            creds = Credentials.from_service_account_info(secret_dict, scopes=scopes)
             return gspread.authorize(creds)
+        else:
+            st.error("❌ Key 'gcp_service_account' not found in Secrets.")
+            return None
     except Exception as e:
-        logging.exception("Error initializing gspread client")
-        st.error(f"❌ Could not initialize Google Sheets client: {e}. Ensure st.secrets['gcp_service_account'] or the GCP_SERVICE_ACCOUNT env var (JSON/base64/path) is set and that the service account has access to the spreadsheet.")
+        st.error(f"❌ Connection Failed: {e}")
         return None
 
 
@@ -649,9 +606,8 @@ if is_evaluator:
                 latest = display_df.iloc[0]
                 display_df["Latest"] = ""
                 display_df.loc[display_df.index[0], "Latest"] = "🏅"
-                st.caption(f"Latest submission: {latest['Name']} — {latest['Date']} — Total Score: {latest['Total Score']}")
-            st.dataframe(display_df[["Latest", "Name", "Total Score", "Date"]])
-
+                st.caption(f"Latest submission: {latest['Name']} — {latest['Date']}")
+                st.dataframe(display_df[["Latest", "Name", "Date"]])
     with tab2:
         if df is None or df.empty:
             st.info("Informing: No submissions found yet.")
@@ -661,14 +617,7 @@ if is_evaluator:
             if selected:
                 rec = df[df["Name"] == selected].sort_values("Date", ascending=False).iloc[0]
                 st.subheader(f"Review: {selected}")
-                st.metric("Total Score", rec.get("Total Score", ""))
-
-                st.write("**Individual Scores**")
-                st.write(f"Financial: {rec.get('Financial Score', '')} / 25")
-                st.write(f"Customer: {rec.get('Customer Score', '')} / 25")
-                st.write(f"Internal Business Processes: {rec.get('Internal Business Processes Score', '')} / 25")
-                st.write(f"Learning & Growth: {rec.get('Learning & Growth Score', '')} / 25")
-
+                st.warning("⚠️ Scores are hidden from this view to preserve candidate privacy.")
                 st.write("**Action Taken (Full Text)**")
                 st.write(f"**Financial:** {rec.get('Financial Action', '')}")
                 st.write(f"**Customer:** {rec.get('Customer Action', '')}")
@@ -792,19 +741,11 @@ else:
                 score_breakdown = {}
                 all_files = []
 
-                keyword_map = {
-                    "Financial": ["revenue", "cost", "profit", "margin", "budget", "pricing", "savings", "income", "expense"],
-                    "Customer": ["customer", "client", "satisfaction", "retention", "feedback", "complaint", "loyalty", "support", "nps"],
-                    "Internal Business Processes": ["process", "efficien", "compliance", "safety", "audit", "quality", "procedure", "automation", "sheq"],
-                    "Learning & Growth": ["train", "develop", "workshop", "ment", "competenc", "engag", "learning", "upskill", "coaching"]
-                }
-
                 for p, data in user_data.items():
                     action_text = (data.get("action") or "").strip()
                     files = data.get("files") or []
-                    kw = keyword_map.get(p, [])
-                    score = score_perspective(action_text, files, kw)
-                    score_breakdown[p] = score
+                    score = _evaluate_perspective(action_text, files)
+                    score_breakdown[p] = int(score)
 
                     # collect files
                     if files:
@@ -814,22 +755,24 @@ else:
                 total_score = sum(score_breakdown.values())
 
                 # Build email body including the score breakdown
-                breakdown_lines = "\n".join([f"**{p}:** {score:.1f} / 25" for p, score in score_breakdown.items()])
+                breakdown_lines = "\n".join([f"{p}: {int(score)}/25%" for p, score in score_breakdown.items()])
                 email_body = f"""
-                **MD’S Quality & Excellence Awards Submission**
+                MD’S Quality & Excellence Awards Submission
 
-                **Name:** {first_name} {last_name}
+                Name: {first_name} {last_name}
 
                 ---
-                **Score Breakdown (per perspective):**
+                Score Breakdown (per perspective):
                 {breakdown_lines}
 
-                **Total Score:** {total_score:.1f} / 100
-
+                Total Score: {int(total_score)}/100%
                 """
 
                 # --- POSTMARK EMAIL LOGIC ---
                 try:
+                    status = st.empty()
+                    status.info("Finalizing submission...")
+
                     client = PostmarkClient(server_token=token)
 
                     # Convert Streamlit UploadedFile objects into Postmark-friendly dicts
@@ -856,7 +799,7 @@ else:
                     actions_only = {p: (user_data[p]["action"] or "") for p in user_data}
                     log_submission(first_name, last_name, score_breakdown, actions_only, folder_url)
 
-                    st.success("✅ Submission successful! Your performance will be reviewed shortly.")
+                    status.success("✅ Finalizing submission...")
                 except Exception as e:
                     st.error(f"⚠️ Error in submission: {str(e)}")
 
