@@ -155,7 +155,11 @@ def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_
         score_breakdown.get("Learning & Growth", 0.0),
         actions_dict.get("Learning & Growth", ""),
         "",  # Evaluator Vote (to be set by evaluators)
-        ""   # Evaluator Comment (to be set by evaluators)
+        "",  # Evaluator Comment (to be set by evaluators)
+        "",  # Stage 1 Recommendation
+        "",  # Stage 1 Comment
+        "",  # Committee Votes
+        ""   # Current Status
     ]
 
     headers = [
@@ -171,7 +175,11 @@ def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_
         "Learning & Growth Score",
         "Learning & Growth Action",
         "Evaluator Vote",
-        "Evaluator Comment"
+        "Evaluator Comment",
+        "Stage 1 Recommendation",
+        "Stage 1 Comment",
+        "Committee Votes",
+        "Current Status"
     ]
 
     try:
@@ -200,7 +208,11 @@ def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_
                 "Internal Business Processes Action": actions_dict.get("Internal Business Processes", ""),
                 "Learning & Growth Score": score_breakdown.get("Learning & Growth", 0.0),
                 "Learning & Growth Action": actions_dict.get("Learning & Growth", ""),
-                "Folder_URL": folder_url
+                "Folder_URL": folder_url,
+                "Stage 1 Recommendation": "",
+                "Stage 1 Comment": "",
+                "Committee Votes": "",
+                "Current Status": ""
             }
             if os.path.exists(CSV_LOG_PATH):
                 df = pd.read_csv(CSV_LOG_PATH)
@@ -239,10 +251,10 @@ def read_records():
             return None
 
 
-def update_evaluator_vote(name, timestamp, vote, comment, lock_token=None):
-    """Update the Evaluator Vote and Evaluator Comment for a given submission.
-    Enforces lock when available (requires valid `lock_token` to update locked rows).
-    Tries Google Sheet first; falls back to updating the local CSV file.
+def update_evaluator_vote(name, timestamp, vote=None, comment=None, lock_token=None, stage1_rec=None, stage1_comment=None, committee_vote=None, evaluator_name=None, current_status=None):
+    """Update evaluator-related fields for a submission.
+    Supports: Evaluator Vote, Evaluator Comment, Stage 1 Recommendation/Comment, Committee Votes (appends evaluator:name:vote), and Current Status.
+    Enforces lock when available. Tries Google Sheet first; falls back to local CSV.
     Returns True on success, False on failure.
     """
     try:
@@ -265,7 +277,6 @@ def update_evaluator_vote(name, timestamp, vote, comment, lock_token=None):
             # fallback to latest by name
             for i, r in enumerate(reversed(records), start=1):
                 if r.get("Name") == name:
-                    # convert reversed index to actual row index
                     row_idx = len(records) - i + 2
                     break
         if not row_idx:
@@ -287,26 +298,38 @@ def update_evaluator_vote(name, timestamp, vote, comment, lock_token=None):
                 if not lock_token or str(lock_token) != str(current_token):
                     raise RuntimeError("Row is locked by another editor; acquire lock before updating")
 
-        # Ensure vote/comment columns exist (append if missing)
-        vote_col = None
-        comment_col = None
-        for idx, h in enumerate(headers, start=1):
-            if h == "Evaluator Vote":
-                vote_col = idx
-            if h == "Evaluator Comment":
-                comment_col = idx
-
+        # Ensure all relevant columns exist (append if missing)
+        col_map = {}
+        targets = ["Evaluator Vote", "Evaluator Comment", "Stage 1 Recommendation", "Stage 1 Comment", "Committee Votes", "Current Status"]
         last_col = len(headers)
-        if vote_col is None:
-            vote_col = last_col + 1
-            worksheet.update_cell(1, vote_col, "Evaluator Vote")
-            last_col = vote_col
-        if comment_col is None:
-            comment_col = last_col + 1
-            worksheet.update_cell(1, comment_col, "Evaluator Comment")
+        for t in targets:
+            col_idx = None
+            for idx, h in enumerate(headers, start=1):
+                if h == t:
+                    col_idx = idx
+                    break
+            if col_idx is None:
+                last_col += 1
+                worksheet.update_cell(1, last_col, t)
+                col_idx = last_col
+            col_map[t] = col_idx
 
-        worksheet.update_cell(row_idx, vote_col, vote)
-        worksheet.update_cell(row_idx, comment_col, comment)
+        # Apply updates
+        if vote is not None:
+            worksheet.update_cell(row_idx, col_map["Evaluator Vote"], vote)
+        if comment is not None:
+            worksheet.update_cell(row_idx, col_map["Evaluator Comment"], comment)
+        if stage1_rec is not None:
+            worksheet.update_cell(row_idx, col_map["Stage 1 Recommendation"], stage1_rec)
+        if stage1_comment is not None:
+            worksheet.update_cell(row_idx, col_map["Stage 1 Comment"], stage1_comment)
+        if committee_vote is not None:
+            existing = worksheet.cell(row_idx, col_map["Committee Votes"]).value or ""
+            new_entry = f"{evaluator_name or 'Evaluator'}:{committee_vote}"
+            updated = existing + (";" if existing else "") + new_entry
+            worksheet.update_cell(row_idx, col_map["Committee Votes"], updated)
+        if current_status is not None:
+            worksheet.update_cell(row_idx, col_map["Current Status"], current_status)
 
         # If a lock token was provided, clear it after a successful update
         if lock_col is not None and lock_token:
@@ -320,15 +343,10 @@ def update_evaluator_vote(name, timestamp, vote, comment, lock_token=None):
         try:
             if os.path.exists(CSV_LOG_PATH):
                 df = pd.read_csv(CSV_LOG_PATH)
-                # Add columns if missing
-                if "Evaluator Vote" not in df.columns:
-                    df["Evaluator Vote"] = ""
-                if "Evaluator Comment" not in df.columns:
-                    df["Evaluator Comment"] = ""
-                if "Lock Token" not in df.columns:
-                    df["Lock Token"] = ""
-                if "Lock Expiry" not in df.columns:
-                    df["Lock Expiry"] = ""
+                # Ensure columns exist
+                for c in ["Evaluator Vote", "Evaluator Comment", "Lock Token", "Lock Expiry", "Stage 1 Recommendation", "Stage 1 Comment", "Committee Votes", "Current Status"]:
+                    if c not in df.columns:
+                        df[c] = ""
 
                 mask = df["Name"] == name
                 if timestamp and "Date" in df.columns:
@@ -345,18 +363,30 @@ def update_evaluator_vote(name, timestamp, vote, comment, lock_token=None):
                     idx = df[df["Name"] == name].last_valid_index()
                     if idx is None:
                         raise RuntimeError("No matching record in CSV to update")
-                    df.at[idx, "Evaluator Vote"] = vote
-                    df.at[idx, "Evaluator Comment"] = comment
-                    # clear locks
-                    if lock_token:
-                        df.at[idx, "Lock Token"] = ""
-                        df.at[idx, "Lock Expiry"] = ""
                 else:
-                    df.loc[mask, "Evaluator Vote"] = vote
-                    df.loc[mask, "Evaluator Comment"] = comment
-                    if lock_token:
-                        df.loc[mask, "Lock Token"] = ""
-                        df.loc[mask, "Lock Expiry"] = ""
+                    idx = df[mask].index[0]
+
+                # Apply updates to CSV row
+                if vote is not None:
+                    df.at[idx, "Evaluator Vote"] = vote
+                if comment is not None:
+                    df.at[idx, "Evaluator Comment"] = comment
+                if stage1_rec is not None:
+                    df.at[idx, "Stage 1 Recommendation"] = stage1_rec
+                if stage1_comment is not None:
+                    df.at[idx, "Stage 1 Comment"] = stage1_comment
+                if committee_vote is not None:
+                    existing = str(df.at[idx, "Committee Votes"] or "")
+                    new_entry = f"{evaluator_name or 'Evaluator'}:{committee_vote}"
+                    updated = existing + (";" if existing else "") + new_entry
+                    df.at[idx, "Committee Votes"] = updated
+                if current_status is not None:
+                    df.at[idx, "Current Status"] = current_status
+
+                # clear locks if provided
+                if lock_token:
+                    df.at[idx, "Lock Token"] = ""
+                    df.at[idx, "Lock Expiry"] = ""
 
                 df.to_csv(CSV_LOG_PATH, index=False)
                 return True
@@ -561,6 +591,46 @@ def release_lock(name, timestamp, token):
 
 # --- SIDEBAR MOTIVATION ---
 with st.sidebar:
+    # --- SIDEBAR LOGO (TOP) ---
+    # Display logo at the very top of the sidebar; fallback to title text if missing.
+    # Accepts filenames with spaces and attempts to match base name 'LOGO WHITE PNG' with any extension.
+    script_dir = os.path.dirname(__file__)
+    logo_path = None
+    for fname in ["LOGO WHITE PNG.png", "LOGO WHITE PNG"]:
+        p = os.path.join(script_dir, fname)
+        if os.path.exists(p):
+            logo_path = p
+            break
+    if not logo_path:
+        try:
+            for f in os.listdir(script_dir):
+                if os.path.splitext(f)[0].lower() == "logo white png":
+                    logo_path = os.path.join(script_dir, f)
+                    break
+        except Exception:
+            logo_path = None
+
+    if logo_path and os.path.exists(logo_path):
+        st.markdown(
+            """
+            <style>
+            /* Make sidebar images sit on a dark tile so white logos are visible on light themes */
+            div[data-testid="stSidebar"] img {
+                background-color: #111 !important;
+                padding: 8px;
+                border-radius: 6px;
+                display: block;
+                margin-left: auto;
+                margin-right: auto;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True
+        )
+        st.image(logo_path, use_container_width=True)
+    else:
+        st.markdown("# 🏆 MD AWARDS")
+
     st.markdown("# 💡 Winning Tips")
     st.info("""
     **To reach 'Extra Mile' status:**
@@ -590,7 +660,7 @@ except Exception:
 
 if is_evaluator:
     st.header("Evaluator Workspace")
-    tab1, tab2 = st.tabs(["Summary Table", "Detailed Review"])
+    tab1, tab2, tab3 = st.tabs(["Summary Table", "Detailed Review", "Final Results"])
     df = read_records()
 
     with tab1:
@@ -617,26 +687,53 @@ if is_evaluator:
             if selected:
                 rec = df[df["Name"] == selected].sort_values("Date", ascending=False).iloc[0]
                 st.subheader(f"Review: {selected}")
-                st.warning("⚠️ Scores are hidden from this view to preserve candidate privacy.")
-                st.write("**Action Taken (Full Text)**")
-                st.write(f"**Financial:** {rec.get('Financial Action', '')}")
-                st.write(f"**Customer:** {rec.get('Customer Action', '')}")
-                st.write(f"**Internal Business Processes:** {rec.get('Internal Business Processes Action', '')}")
-                st.write(f"**Learning & Growth:** {rec.get('Learning & Growth Action', '')}")
 
-                folder_url = rec.get('Folder_URL') or f"https://drive.google.com/drive/folders/{GDRIVE_HOLDER_ID}"
+                # --- Scores & Metrics ---
+                def _num(x):
+                    try:
+                        return float(x)
+                    except Exception:
+                        return 0.0
+
+                fin_score = _num(rec.get("Financial Score", 0))
+                cust_score = _num(rec.get("Customer Score", 0))
+                ibp_score = _num(rec.get("Internal Business Processes Score", 0))
+                lg_score = _num(rec.get("Learning & Growth Score", 0))
+                total_score = _num(rec.get("Total Score", fin_score + cust_score + ibp_score + lg_score))
+
+                cols = st.columns(5)
+                cols[0].metric("Total Score", f"{total_score:.1f}/100")
+                cols[1].metric("Financial", f"{fin_score:.1f}/25")
+                cols[2].metric("Customer", f"{cust_score:.1f}/25")
+                cols[3].metric("Internal BP", f"{ibp_score:.1f}/25")
+                cols[4].metric("Learning & Growth", f"{lg_score:.1f}/25")
+
+                st.write("**Action Taken (Full Text)**")
+                st.write(f"**Financial ({fin_score:.1f}/25):** {rec.get('Financial Action', '')}")
+                st.write(f"**Customer ({cust_score:.1f}/25):** {rec.get('Customer Action', '')}")
+                st.write(f"**Internal Business Processes ({ibp_score:.1f}/25):** {rec.get('Internal Business Processes Action', '')}")
+                st.write(f"**Learning & Growth ({lg_score:.1f}/25):** {rec.get('Learning & Growth Action', '')}")
+
+                # Evidence link — prefer record-specific Folder_URL, else fall back
+                folder_url = rec.get('Folder_URL') if rec.get('Folder_URL') is not None else ""
+                if pd.isna(folder_url) or str(folder_url).strip() == "" or str(folder_url).strip().lower() == "nan":
+                    folder_url = f"https://drive.google.com/drive/folders/{GDRIVE_HOLDER_ID}"
                 try:
-                    st.link_button("📂 Open Candidate Evidence", url=folder_url)
+                    st.link_button("📂 Open Candidate Evidence", url=folder_url, use_container_width=True)
                 except Exception:
                     st.markdown(f"[📂 Open Candidate Evidence]({folder_url})")
 
-                # --- Evaluator vote & comment UI with locking ---
+                # --- Evaluator vote & comment UI with locking + 2-stage flow ---
                 st.divider()
                 st.subheader("Evaluator Vote & Comment")
 
                 # Pre-fill existing evaluator vote/comment if present
                 existing_vote = rec.get("Evaluator Vote", "") if rec is not None else ""
                 existing_comment = rec.get("Evaluator Comment", "") if rec is not None else ""
+
+                # Stage 1 fields if present
+                stage1_rec = rec.get("Stage 1 Recommendation", "")
+                stage1_comment_existing = rec.get("Stage 1 Comment", "")
 
                 # Lock state in session
                 lock_key = f"lock_token_{selected}"
@@ -646,6 +743,7 @@ if is_evaluator:
 
                 timestamp = rec.get("Timestamp") or rec.get("Date")
 
+                # Lock controls
                 if locked_token:
                     st.info(f"🔒 You hold the edit lock. Expires: {locked_expiry}")
                     if st.button("Release Lock", key=f"release_lock_{selected}"):
@@ -669,6 +767,72 @@ if is_evaluator:
                         else:
                             st.error("⚠️ Could not acquire lock. See messages above.")
 
+                # Stage 1 UI: Primary evaluator recommends for shortlist
+                if not stage1_rec or pd.isna(stage1_rec) or str(stage1_rec).strip() == "":
+                    st.markdown("#### Stage 1 — Primary Review")
+                    st.caption("Primary evaluator: recommend candidate for finals or reject.")
+                    rec_choice = st.radio("Stage 1 Recommendation", ["", "Recommend for Finals", "Reject"], index=0, key=f"stage1_choice_{selected}", disabled=not locked_token)
+                    rec_comment = st.text_area("Stage 1 Comment (optional)", value=(stage1_comment_existing or ""), key=f"stage1_comment_{selected}", disabled=not locked_token)
+                    if st.button("Submit Stage 1 Recommendation", key=f"submit_stage1_{selected}"):
+                        if not locked_token:
+                            st.error("⚠️ Acquire an edit lock before submitting.")
+                        elif rec_choice == "" :
+                            st.error("⚠️ Select a recommendation before submitting.")
+                        else:
+                            ok = update_evaluator_vote(selected, timestamp, lock_token=locked_token, stage1_rec=rec_choice, stage1_comment=rec_comment, current_status="Stage 1 Recommended" if "Recommend" in rec_choice else "Stage 1 Rejected")
+                            if ok:
+                                # release lock
+                                released = release_lock(selected, timestamp, locked_token)
+                                if lock_key in st.session_state:
+                                    del st.session_state[lock_key]
+                                if expiry_key in st.session_state:
+                                    del st.session_state[expiry_key]
+                                if released:
+                                    st.success("✅ Stage 1 Recommendation submitted and lock released.")
+                                else:
+                                    st.success("✅ Stage 1 Recommendation submitted.")
+                                df = read_records()
+                            else:
+                                st.error("⚠️ Could not submit Stage 1 recommendation.")
+                else:
+                    st.success(f"✅ Stage 1 recommendation: {stage1_rec}")
+                    if pd.isna(stage1_comment_existing) or not stage1_comment_existing:
+                        st.write("_No Stage 1 comment provided._")
+                    else:
+                        st.write(f"**Stage 1 Comment:** {stage1_comment_existing}")
+
+                    # Stage 2 UI: Committee evaluators cast final vote
+                    st.markdown("#### Stage 2 — Committee Review")
+                    st.caption("If you are a Stage 2 evaluator, cast your final vote below.")
+                    evaluator_name = st.text_input("Your Name", placeholder="Enter your name", key=f"evaluator_name_{selected}")
+                    final_vote_options = ["", "Winner", "Runner-up", "Reject"]
+                    final_vote = st.selectbox("Final Vote", final_vote_options, index=0, key=f"final_vote_{selected}", disabled=not locked_token)
+                    stage2_comment = st.text_area("Comment (optional)", value="", key=f"stage2_comment_{selected}", disabled=not locked_token)
+                    if st.button("Submit Committee Vote", key=f"submit_committee_{selected}"):
+                        if not locked_token:
+                            st.error("⚠️ Acquire an edit lock before submitting.")
+                        elif final_vote == "":
+                            st.error("⚠️ Select a final vote before submitting.")
+                        elif not evaluator_name:
+                            st.error("⚠️ Please enter your name for committee records.")
+                        else:
+                            ok = update_evaluator_vote(selected, timestamp, lock_token=locked_token, committee_vote=final_vote, evaluator_name=evaluator_name, comment=stage2_comment, current_status="Stage 2 In Progress")
+                            if ok:
+                                # Optional: keep lock or release? release for now
+                                released = release_lock(selected, timestamp, locked_token)
+                                if lock_key in st.session_state:
+                                    del st.session_state[lock_key]
+                                if expiry_key in st.session_state:
+                                    del st.session_state[expiry_key]
+                                if released:
+                                    st.success("✅ Committee vote submitted and lock released.")
+                                else:
+                                    st.success("✅ Committee vote submitted.")
+                                df = read_records()
+                            else:
+                                st.error("⚠️ Could not submit committee vote.")
+
+                # Legacy submit (keeps previous behaviour — single-editor vote & comment)
                 vote_options = ["", "Shortlist", "Winner", "Reject"]
                 disabled = False if locked_token else True
                 vote_choice = st.selectbox("Your vote", vote_options, index=vote_options.index(existing_vote) if existing_vote in vote_options else 0, key=f"vote_{selected}", disabled=disabled)
@@ -690,10 +854,72 @@ if is_evaluator:
                                 st.success("✅ Vote & Comment submitted and lock released.")
                             else:
                                 st.success("✅ Vote & Comment submitted.")
-                            # Refresh the DataFrame so changes appear immediately
                             df = read_records()
                         else:
                             st.error("⚠️ Could not submit vote/comment. See messages above.")
+
+    # --- Final Results tab ---
+    with tab3:
+        st.subheader("Final Results — Recommended Candidates")
+        if df is None or df.empty:
+            st.info("No submissions found yet.")
+        else:
+            df_view = df.copy()
+            if "Stage 1 Recommendation" in df_view.columns:
+                mask = df_view["Stage 1 Recommendation"].fillna("").str.lower().str.contains("recommend")
+            else:
+                mask = pd.Series([False] * len(df_view))
+            recs = df_view[mask]
+            if recs.empty:
+                st.info("No candidates have been recommended for finals yet.")
+            else:
+                def vote_to_weight(v):
+                    v = str(v or "").strip().lower()
+                    if "winner" in v:
+                        return 1.0
+                    if "runner" in v:
+                        return 0.7
+                    if "shortlist" in v:
+                        return 0.5
+                    return 0.0
+
+                rows = []
+                for _, r in recs.iterrows():
+                    name = r.get("Name")
+                    sys_score = None
+                    for key in ("Total Score",):
+                        try:
+                            sys_score = float(r.get(key))
+                            break
+                        except Exception:
+                            sys_score = None
+                    if sys_score is None:
+                        try:
+                            sys_score = sum([float(r.get("Financial Score", 0)), float(r.get("Customer Score", 0)), float(r.get("Internal Business Processes Score", 0)), float(r.get("Learning & Growth Score", 0))])
+                        except Exception:
+                            sys_score = 0.0
+
+                    committee = str(r.get("Committee Votes", "") or "")
+                    weights = []
+                    if committee:
+                        for part in committee.split(";"):
+                            if ":" in part:
+                                _, v = part.split(":", 1)
+                            else:
+                                v = part
+                            weights.append(vote_to_weight(v))
+                    else:
+                        if r.get("Evaluator Vote"):
+                            weights.append(vote_to_weight(r.get("Evaluator Vote")))
+
+                    avg_w = float(sum(weights) / len(weights)) if weights else 0.0
+                    final_rank = sys_score * 0.4 + (avg_w * 100) * 0.6
+                    rows.append({"Name": name, "Total Score": sys_score, "Committee Votes": committee, "Avg Vote Weight": round(avg_w, 2), "Final Rank": round(final_rank, 1), "Current Status": r.get("Current Status", "")})
+
+                result_df = pd.DataFrame(rows).sort_values("Final Rank", ascending=False)
+                st.dataframe(result_df)
+                top = result_df.iloc[0]
+                st.metric("Top Candidate", top["Name"], delta=f"Score: {top['Final Rank']}")
 
 else:
     # Employee Submission Form
