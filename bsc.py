@@ -8,8 +8,14 @@ import uuid
 import gspread
 from google.oauth2.service_account import Credentials
 import base64
+import io
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.errors import HttpError
 import logging
 import argparse
+import socket
+import time
 
 # --- CONFIGURATION ---
 # Try to load a local .env file if python-dotenv is installed (development convenience).
@@ -133,15 +139,182 @@ def get_gspread_client():
         return None
 
 
-def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_url):
+def create_drive_service(attempts: int = 3, backoff: float = 1.0):
+    """Create a Google Drive service client using the same service account in secrets.
+    This function will retry transient network/DNS failures a few times with exponential backoff.
+    Raises ConnectionError on persistent network failures, or returns a Resource on success.
+    """
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    if "gcp_service_account" not in st.secrets:
+        st.error("❌ Key 'gcp_service_account' not found in Secrets; Drive uploads disabled.")
+        return None
+
+    secret_dict = dict(st.secrets["gcp_service_account"])
+
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            # Explicitly use from_service_account_info as required
+            creds = Credentials.from_service_account_info(secret_dict, scopes=scopes)
+            service = build("drive", "v3", credentials=creds)
+
+            # Quick connectivity test: attempt a tiny listing to ensure service + network are reachable
+            try:
+                service.files().list(pageSize=1, fields="nextPageToken").execute()
+            except Exception as e:
+                # Treat DNS/connection problems as transient and retry
+                last_exc = e
+                # If this is clearly a network-related error, retry; otherwise surface it
+                if isinstance(e, (OSError, socket.gaierror)) or (hasattr(e, 'resp') and getattr(e, 'resp', None) and getattr(e, 'resp', None).status >= 500):
+                    if attempt < attempts:
+                        time.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    else:
+                        raise ConnectionError(f"Network/Drive connectivity check failed: {e}") from e
+                else:
+                    raise
+
+            return service
+        except Exception as e:
+            last_exc = e
+            # If network-like, retry; otherwise break and show a helpful message
+            if isinstance(e, (OSError, socket.gaierror)):
+                if attempt < attempts:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                else:
+                    raise ConnectionError(f"Could not create Drive service due to network/DNS error: {e}") from e
+            # For HttpError with 5xx treat as transient
+            if isinstance(e, HttpError):
+                try:
+                    status = int(e.resp.status)
+                except Exception:
+                    status = None
+                if status and 500 <= status < 600 and attempt < attempts:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+            # Non-network error - inform user and return None
+            st.error(f"❌ Could not create Drive service: {e}")
+            return None
+
+    # If we exit loop, raise last exception
+    raise last_exc
+
+
+def _is_network_error(e):
+    """Return True if exception looks like a network/DNS/temporary transport error."""
+    if isinstance(e, HttpError):
+        try:
+            status = int(e.resp.status)
+            return 500 <= status < 600
+        except Exception:
+            return False
+    if isinstance(e, (OSError, socket.gaierror, ConnectionError)):
+        return True
+    return False
+
+
+def _retry_api_call(callable_fn, attempts: int = 3, backoff: float = 1.0):
+    """Generic retry wrapper for Drive API calls. Retries on network-like exceptions."""
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return callable_fn()
+        except Exception as e:
+            last_exc = e
+            if _is_network_error(e) and attempt < attempts:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
+            raise
+    raise last_exc
+
+
+def _drive_connectivity_check(service):
+    """Perform a lightweight connectivity check against the Drive API."""
+    try:
+        _retry_api_call(lambda: service.files().list(pageSize=1, fields="nextPageToken").execute(), attempts=3)
+        return True
+    except Exception as e:
+        raise ConnectionError(f"Drive connectivity check failed: {e}") from e
+
+
+def upload_to_gdrive(all_files_dict, first_name, last_name):
+    """Upload files to a uniquely named sub-folder in GDRIVE_HOLDER_ID.
+
+    Args:
+        all_files_dict: dict mapping perspective -> list of Streamlit UploadedFile objects
+        first_name, last_name: strings for folder naming
+
+    Returns: (folder_url, files_meta)
+        - folder_url: URL of the created folder (or holder folder on no files)
+        - files_meta: dict mapping perspective -> list of {name, id, webViewLink}
+    """
+    service = create_drive_service()
+    if not service:
+        raise RuntimeError("Google Drive service not available")
+
+    # Ensure that the Drive service is reachable first
+    _drive_connectivity_check(service)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    folder_name = f"{first_name.strip()}_{last_name.strip()}_{timestamp}"
+    try:
+        folder_meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [GDRIVE_HOLDER_ID]}
+        folder = _retry_api_call(lambda: service.files().create(body=folder_meta, fields="id,webViewLink").execute(), attempts=3)
+        folder_id = folder.get("id")
+        folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
+
+        files_meta = {}
+        for perspective, flist in (all_files_dict or {}).items():
+            files_meta[perspective] = []
+            if not flist:
+                continue
+            for up in flist:
+                try:
+                    bio = io.BytesIO(up.getvalue())
+                    media = MediaIoBaseUpload(bio, mimetype=up.type or "application/octet-stream", resumable=False)
+                    file_metadata = {"name": up.name, "parents": [folder_id]}
+                    created = _retry_api_call(lambda: service.files().create(body=file_metadata, media_body=media, fields="id,name,webViewLink").execute(), attempts=3)
+                    file_id = created.get("id")
+                    webViewLink = created.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+                    # Make file viewable by anyone with link (best-effort; may fail in restricted domains)
+                    try:
+                        _retry_api_call(lambda: service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id").execute(), attempts=2)
+                    except HttpError:
+                        # ignore permission issues
+                        pass
+                    files_meta[perspective].append({"name": created.get("name"), "id": file_id, "webViewLink": webViewLink})
+                except Exception as e:
+                    # If a network error occurs mid-upload, bubble it up so the caller can apply the fault-tolerant fallback.
+                    if _is_network_error(e):
+                        raise
+                    st.warning(f"⚠️ Could not upload file {getattr(up, 'name', 'unknown')}: {e}")
+        return folder_url, files_meta
+    except Exception as e:
+        # Normalize network-like issues as ConnectionError so callers can detect them
+        if _is_network_error(e):
+            raise ConnectionError(e)
+        raise RuntimeError(f"Drive upload failed: {e}")
+
+
+def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_url, files_map=None):
     """Append a submission record to the Google Sheet 'MD Awards Voting'.
     Falls back to local CSV if Google Sheets API is unavailable.
+
+    files_map should be a dict mapping perspective -> list of {name,id,webViewLink}
+    and will be serialized to JSON in the 'Files_JSON' column.
     """
     name = f"{first_name.strip()} {last_name.strip()}".strip()
     timestamp = datetime.now().isoformat()
     total_score = round(sum(score_breakdown.values()), 1)
 
-    # Row layout written to Google Sheet
+    files_json = json.dumps(files_map) if files_map else ""
+
+    # Row layout written to Google Sheet (Files_JSON & Folder_URL added)
     row = [
         name,
         timestamp,
@@ -154,6 +327,8 @@ def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_
         actions_dict.get("Internal Business Processes", ""),
         score_breakdown.get("Learning & Growth", 0.0),
         actions_dict.get("Learning & Growth", ""),
+        folder_url,
+        files_json,
         "",  # Evaluator Vote (to be set by evaluators)
         "",  # Evaluator Comment (to be set by evaluators)
         "",  # Stage 1 Recommendation
@@ -174,6 +349,8 @@ def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_
         "Internal Business Processes Action",
         "Learning & Growth Score",
         "Learning & Growth Action",
+        "Folder_URL",
+        "Files_JSON",
         "Evaluator Vote",
         "Evaluator Comment",
         "Stage 1 Recommendation",
@@ -188,9 +365,18 @@ def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_
             raise RuntimeError("GCP Sheets client unavailable")
         sh = gc.open("MD Awards Voting")
         worksheet = sh.sheet1
-        existing = worksheet.get_all_values()
-        if not existing:
+
+        # Ensure headers exist and add missing ones if needed
+        existing_headers = worksheet.row_values(1)
+        if not existing_headers:
             worksheet.append_row(headers)
+        else:
+            last_col = len(existing_headers)
+            for h in headers:
+                if h not in existing_headers:
+                    last_col += 1
+                    worksheet.update_cell(1, last_col, h)
+
         worksheet.append_row(row)
     except Exception as e:
         st.error(f"⚠️ Could not write submission to Google Sheet: {e}")
@@ -209,6 +395,7 @@ def log_submission(first_name, last_name, score_breakdown, actions_dict, folder_
                 "Learning & Growth Score": score_breakdown.get("Learning & Growth", 0.0),
                 "Learning & Growth Action": actions_dict.get("Learning & Growth", ""),
                 "Folder_URL": folder_url,
+                "Files_JSON": files_json,
                 "Stage 1 Recommendation": "",
                 "Stage 1 Comment": "",
                 "Committee Votes": "",
@@ -714,14 +901,74 @@ if is_evaluator:
                 st.write(f"**Internal Business Processes ({ibp_score:.1f}/25):** {rec.get('Internal Business Processes Action', '')}")
                 st.write(f"**Learning & Growth ({lg_score:.1f}/25):** {rec.get('Learning & Growth Action', '')}")
 
+                # Show per-perspective uploaded files (if any) with preview links
+                files_json_raw = rec.get('Files_JSON') or rec.get('Files') or ""
+                files_by_persp = {}
+                if files_json_raw and not pd.isna(files_json_raw):
+                    try:
+                        if isinstance(files_json_raw, str):
+                            files_by_persp = json.loads(files_json_raw)
+                        else:
+                            files_by_persp = files_json_raw
+                    except Exception:
+                        files_by_persp = {}
+
+                if files_by_persp:
+                    st.markdown("**Uploaded Evidence by Perspective**")
+                    for p in bsc_structure.keys():
+                        flist = files_by_persp.get(p) or []
+                        if not flist:
+                            continue
+                        st.markdown(f"**{p}:**")
+                        for i, fmeta in enumerate(flist):
+                            name = fmeta.get('name') or fmeta.get('Name') or ''
+                            preview = fmeta.get('webViewLink') or (fmeta.get('id') and f"https://drive.google.com/file/d/{fmeta.get('id')}/preview") or ''
+                            cols = st.columns([6,1])
+                            cols[0].write(name)
+                            if preview:
+                                # Render a Preview button which sets a session state key to avoid preloading iframes
+                                btn_key = f"preview_btn_{selected}_{p}_{i}"
+                                if cols[1].button("👁️ Preview", key=btn_key):
+                                    st.session_state[f"preview_url_{selected}"] = preview
+                                    st.session_state[f"preview_name_{selected}"] = name
+
+                # If a preview has been selected, render it below the file lists (lazy-loaded iframe)
+                preview_key = f"preview_url_{selected}"
+                if preview_key in st.session_state and st.session_state.get(preview_key):
+                    st.markdown("---")
+                    st.markdown(f"**Preview: {st.session_state.get(f'preview_name_{selected}', '')}**")
+                    try:
+                        # Use a reasonable height; evaluators can scroll within the iframe
+                        st.components.v1.iframe(st.session_state[preview_key], height=700)
+                    except Exception as e:
+                        st.error(f"⚠️ Could not render preview iframe: {e}")
+
+                    if st.button("Close Preview", key=f"close_preview_{selected}"):
+                        try:
+                            del st.session_state[preview_key]
+                        except Exception:
+                            pass
+                        # also clear name if set
+                        name_key = f"preview_name_{selected}"
+                        if name_key in st.session_state:
+                            try:
+                                del st.session_state[name_key]
+                            except Exception:
+                                pass
+
                 # Evidence link — prefer record-specific Folder_URL, else fall back
                 folder_url = rec.get('Folder_URL') if rec.get('Folder_URL') is not None else ""
                 if pd.isna(folder_url) or str(folder_url).strip() == "" or str(folder_url).strip().lower() == "nan":
                     folder_url = f"https://drive.google.com/drive/folders/{GDRIVE_HOLDER_ID}"
-                try:
-                    st.link_button("📂 Open Candidate Evidence", url=folder_url, use_container_width=True)
-                except Exception:
-                    st.markdown(f"[📂 Open Candidate Evidence]({folder_url})")
+
+                # If a previous submission recorded an upload error, instruct evaluators to check email attachments instead
+                if isinstance(folder_url, str) and 'Upload Error' in folder_url:
+                    st.warning('Files were successfully sent via email, but a temporary network error prevented them from being saved to the Cloud Folder. Please check the submission email attachments.')
+                else:
+                    try:
+                        st.link_button("📂 Open Candidate Evidence", url=folder_url, use_container_width=True)
+                    except Exception:
+                        st.markdown(f"[📂 Open Candidate Evidence]({folder_url})")
 
                 # --- Evaluator vote & comment UI with locking + 2-stage flow ---
                 st.divider()
@@ -1001,15 +1248,42 @@ else:
 
                     client = PostmarkClient(server_token=token)
 
+                    # Build a per-perspective files dict and upload to Drive
+                    all_files_dict = {p: (user_data[p].get("files") or []) for p in user_data}
+                    try:
+                        folder_url, uploaded_files_meta = upload_to_gdrive(all_files_dict, first_name, last_name)
+                    except Exception as e:
+                        logging.exception("Drive upload failed")
+                        # If it's a network/DNS/connection issue, mark for manual review and continue
+                        if _is_network_error(e) or isinstance(e, (ConnectionError, OSError, socket.gaierror)):
+                            folder_url = 'Manual Review Required (Upload Error)'
+                            uploaded_files_meta = {}
+                            st.warning('Files were successfully sent via email, but a temporary network error prevented them from being saved to the Cloud Folder.')
+                        else:
+                            st.warning(f"⚠️ Could not upload to Google Drive: {e}")
+                            folder_url = f"https://drive.google.com/drive/folders/{GDRIVE_HOLDER_ID}"
+                            uploaded_files_meta = {}
+
+                    # Append a simple listing of uploaded files to the email body for easy access
+                    if uploaded_files_meta:
+                        email_body += "\n\nEvidence Files:\n"
+                        for p, flist in uploaded_files_meta.items():
+                            if flist:
+                                email_body += f"\n{p}:\n"
+                                for f in flist:
+                                    link = f.get('webViewLink') or (f.get('id') and f"https://drive.google.com/file/d/{f.get('id')}/view")
+                                    email_body += f"- {f.get('name')}: {link}\n"
+
                     # Convert Streamlit UploadedFile objects into Postmark-friendly dicts
                     pm_attachments = []
-                    for up in all_files:
-                        raw = up.getvalue()  # bytes
-                        pm_attachments.append({
-                            "Name": up.name,
-                            "Content": base64.b64encode(raw).decode("ascii"),
-                            "ContentType": up.type or "application/octet-stream"
-                        })
+                    for pfiles in all_files_dict.values():
+                        for up in pfiles:
+                            raw = up.getvalue()  # bytes
+                            pm_attachments.append({
+                                "Name": up.name,
+                                "Content": base64.b64encode(raw).decode("ascii"),
+                                "ContentType": up.type or "application/octet-stream"
+                            })
 
                     # Send Email (attachments optional)
                     response = client.emails.send(
@@ -1020,10 +1294,9 @@ else:
                         Attachments=pm_attachments
                     )
 
-                    # Log submission to CSV including action text and folder URL
-                    folder_url = f"https://drive.google.com/drive/folders/{GDRIVE_HOLDER_ID}"
+                    # Log submission (includes folder URL and per-perspective files JSON)
                     actions_only = {p: (user_data[p]["action"] or "") for p in user_data}
-                    log_submission(first_name, last_name, score_breakdown, actions_only, folder_url)
+                    log_submission(first_name, last_name, score_breakdown, actions_only, folder_url, files_map=uploaded_files_meta)
 
                     status.success("✅ Finalizing submission...")
                 except Exception as e:
