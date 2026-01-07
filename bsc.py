@@ -264,7 +264,7 @@ def upload_to_gdrive(all_files_dict, first_name, last_name):
     folder_name = f"{first_name.strip()}_{last_name.strip()}_{timestamp}"
     try:
         folder_meta = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder", "parents": [GDRIVE_HOLDER_ID]}
-        folder = _retry_api_call(lambda: service.files().create(body=folder_meta, fields="id,webViewLink").execute(), attempts=3)
+        folder = _retry_api_call(lambda: service.files().create(body=folder_meta, fields="id,webViewLink", supportsAllDrives=True).execute(), attempts=3)
         folder_id = folder.get("id")
         folder_url = f"https://drive.google.com/drive/folders/{folder_id}"
 
@@ -278,12 +278,12 @@ def upload_to_gdrive(all_files_dict, first_name, last_name):
                     bio = io.BytesIO(up.getvalue())
                     media = MediaIoBaseUpload(bio, mimetype=up.type or "application/octet-stream", resumable=False)
                     file_metadata = {"name": up.name, "parents": [folder_id]}
-                    created = _retry_api_call(lambda: service.files().create(body=file_metadata, media_body=media, fields="id,name,webViewLink").execute(), attempts=3)
+                    created = _retry_api_call(lambda: service.files().create(body=file_metadata, media_body=media, fields="id,name,webViewLink", supportsAllDrives=True).execute(), attempts=3)
                     file_id = created.get("id")
                     webViewLink = created.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
                     # Make file viewable by anyone with link (best-effort; may fail in restricted domains)
                     try:
-                        _retry_api_call(lambda: service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id").execute(), attempts=2)
+                        _retry_api_call(lambda: service.permissions().create(fileId=file_id, body={"type": "anyone", "role": "reader"}, fields="id", supportsAllDrives=True).execute(), attempts=2)
                     except HttpError:
                         # ignore permission issues
                         pass
@@ -913,62 +913,116 @@ if is_evaluator:
                     except Exception:
                         files_by_persp = {}
 
-                if files_by_persp:
-                    st.markdown("**Uploaded Evidence by Perspective**")
-                    for p in bsc_structure.keys():
-                        flist = files_by_persp.get(p) or []
-                        if not flist:
-                            continue
-                        st.markdown(f"**{p}:**")
-                        for i, fmeta in enumerate(flist):
-                            name = fmeta.get('name') or fmeta.get('Name') or ''
-                            preview = fmeta.get('webViewLink') or (fmeta.get('id') and f"https://drive.google.com/file/d/{fmeta.get('id')}/preview") or ''
-                            cols = st.columns([6,1])
-                            cols[0].write(name)
-                            if preview:
-                                # Render a Preview button which sets a session state key to avoid preloading iframes
-                                btn_key = f"preview_btn_{selected}_{p}_{i}"
-                                if cols[1].button("👁️ Preview", key=btn_key):
-                                    st.session_state[f"preview_url_{selected}"] = preview
-                                    st.session_state[f"preview_name_{selected}"] = name
+                # Determine folder URL exactly as stored in the record (do not auto-fallback here)
+                raw_folder = rec.get('Folder_URL') or ""
+                is_folder_blank = pd.isna(raw_folder) or str(raw_folder).strip() == "" or str(raw_folder).strip().lower() == "nan"
+                # Treat an explicit fallback message as 'no folder' as requested
+                is_folder_fallback_msg = isinstance(raw_folder, str) and 'check email for attachments' in raw_folder.lower()
 
-                # If a preview has been selected, render it below the file lists (lazy-loaded iframe)
-                preview_key = f"preview_url_{selected}"
-                if preview_key in st.session_state and st.session_state.get(preview_key):
-                    st.markdown("---")
-                    st.markdown(f"**Preview: {st.session_state.get(f'preview_name_{selected}', '')}**")
-                    try:
-                        # Use a reasonable height; evaluators can scroll within the iframe
-                        st.components.v1.iframe(st.session_state[preview_key], height=700)
-                    except Exception as e:
-                        st.error(f"⚠️ Could not render preview iframe: {e}")
+                # If there's no folder recorded, show a simple info note (and do not display the folder button)
+                if is_folder_blank or is_folder_fallback_msg:
+                    # If there are no file metadata to show either, display an info message
+                    if not files_by_persp:
+                        st.info('ℹ️ No digital evidence was uploaded by this candidate.')
+                    else:
+                        # Still allow previewing of any inline Files_JSON entries but do not show a folder button
+                        st.markdown("**Uploaded Evidence by Perspective**")
+                        left_col, right_col = st.columns([4,6])
+                        with left_col:
+                            for p in bsc_structure.keys():
+                                flist = files_by_persp.get(p) or []
+                                if not flist:
+                                    continue
+                                st.markdown(f"**{p}:**")
+                                for i, fmeta in enumerate(flist):
+                                    name = fmeta.get('name') or fmeta.get('Name') or ''
+                                    preview = fmeta.get('webViewLink') or (fmeta.get('id') and f"https://drive.google.com/file/d/{fmeta.get('id')}/preview") or ''
+                                    rcols = st.columns([6,1])
+                                    rcols[0].write(name)
+                                    if preview:
+                                        btn_key = f"preview_btn_{selected}_{p}_{i}"
+                                        if rcols[1].button("👁️ Preview", key=btn_key):
+                                            st.session_state[f"preview_url_{selected}"] = preview
+                                            st.session_state[f"preview_name_{selected}"] = name
+                        with right_col:
+                            preview_key = f"preview_url_{selected}"
+                            if preview_key in st.session_state and st.session_state.get(preview_key):
+                                st.markdown(f"**Preview: {st.session_state.get(f'preview_name_{selected}', '')}**")
+                                try:
+                                    st.components.v1.iframe(st.session_state[preview_key], height=700)
+                                except Exception as e:
+                                    st.error(f"⚠️ Could not render preview iframe: {e}")
 
-                    if st.button("Close Preview", key=f"close_preview_{selected}"):
-                        try:
-                            del st.session_state[preview_key]
-                        except Exception:
-                            pass
-                        # also clear name if set
-                        name_key = f"preview_name_{selected}"
-                        if name_key in st.session_state:
-                            try:
-                                del st.session_state[name_key]
-                            except Exception:
-                                pass
-
-                # Evidence link — prefer record-specific Folder_URL, else fall back
-                folder_url = rec.get('Folder_URL') if rec.get('Folder_URL') is not None else ""
-                if pd.isna(folder_url) or str(folder_url).strip() == "" or str(folder_url).strip().lower() == "nan":
-                    folder_url = f"https://drive.google.com/drive/folders/{GDRIVE_HOLDER_ID}"
-
-                # If a previous submission recorded an upload error, instruct evaluators to check email attachments instead
-                if isinstance(folder_url, str) and 'Upload Error' in folder_url:
-                    st.warning('Files were successfully sent via email, but a temporary network error prevented them from being saved to the Cloud Folder. Please check the submission email attachments.')
+                                if st.button("Close Preview", key=f"close_preview_{selected}"):
+                                    try:
+                                        del st.session_state[preview_key]
+                                    except Exception:
+                                        pass
+                                    name_key = f"preview_name_{selected}"
+                                    if name_key in st.session_state:
+                                        try:
+                                            del st.session_state[name_key]
+                                        except Exception:
+                                            pass
+                            else:
+                                st.info("Select a file to preview from the list on the left.")
                 else:
-                    try:
-                        st.link_button("📂 Open Candidate Evidence", url=folder_url, use_container_width=True)
-                    except Exception:
-                        st.markdown(f"[📂 Open Candidate Evidence]({folder_url})")
+                    # Folder is present — show side-by-side file list and preview, and provide the folder link
+                    folder_url = str(raw_folder).strip()
+
+                    # If a previous submission recorded an upload error, instruct evaluators to check email attachments instead
+                    if isinstance(folder_url, str) and 'Upload Error' in folder_url:
+                        st.warning('Files were successfully sent via email, but a temporary network error prevented them from being saved to the Cloud Folder. Please check the submission email attachments.')
+
+                    left_col, right_col = st.columns([4,6])
+                    with left_col:
+                        if files_by_persp:
+                            st.markdown("**Uploaded Evidence by Perspective**")
+                            for p in bsc_structure.keys():
+                                flist = files_by_persp.get(p) or []
+                                if not flist:
+                                    continue
+                                st.markdown(f"**{p}:**")
+                                for i, fmeta in enumerate(flist):
+                                    name = fmeta.get('name') or fmeta.get('Name') or ''
+                                    preview = fmeta.get('webViewLink') or (fmeta.get('id') and f"https://drive.google.com/file/d/{fmeta.get('id')}/preview") or ''
+                                    rcols = st.columns([6,1])
+                                    rcols[0].write(name)
+                                    if preview:
+                                        btn_key = f"preview_btn_{selected}_{p}_{i}"
+                                        if rcols[1].button("👁️ Preview", key=btn_key):
+                                            st.session_state[f"preview_url_{selected}"] = preview
+                                            st.session_state[f"preview_name_{selected}"] = name
+                        else:
+                            st.info('No files are listed for this candidate in the record. Use the folder button to inspect uploads in Drive if any exist.')
+
+                        try:
+                            st.link_button("📂 Open Candidate Evidence", url=folder_url, use_container_width=True)
+                        except Exception:
+                            st.markdown(f"[📂 Open Candidate Evidence]({folder_url})")
+
+                    with right_col:
+                        preview_key = f"preview_url_{selected}"
+                        if preview_key in st.session_state and st.session_state.get(preview_key):
+                            st.markdown(f"**Preview: {st.session_state.get(f'preview_name_{selected}', '')}**")
+                            try:
+                                st.components.v1.iframe(st.session_state[preview_key], height=700)
+                            except Exception as e:
+                                st.error(f"⚠️ Could not render preview iframe: {e}")
+
+                            if st.button("Close Preview", key=f"close_preview_{selected}"):
+                                try:
+                                    del st.session_state[preview_key]
+                                except Exception:
+                                    pass
+                                name_key = f"preview_name_{selected}"
+                                if name_key in st.session_state:
+                                    try:
+                                        del st.session_state[name_key]
+                                    except Exception:
+                                        pass
+                        else:
+                            st.info("Select a file to preview from the list on the left. Click 'Open Candidate Evidence' to open the folder in a new tab.")
 
                 # --- Evaluator vote & comment UI with locking + 2-stage flow ---
                 st.divider()
@@ -1261,9 +1315,8 @@ else:
                             st.warning('Files were successfully sent via email, but a temporary network error prevented them from being saved to the Cloud Folder.')
                         else:
                             st.warning(f"⚠️ Could not upload to Google Drive: {e}")
-                            folder_url = f"https://drive.google.com/drive/folders/{GDRIVE_HOLDER_ID}"
-                            uploaded_files_meta = {}
-
+                        # No Drive folder available for this submission; instruct evaluators to check email attachments
+                        folder_url = "Check Email for Attachments"
                     # Append a simple listing of uploaded files to the email body for easy access
                     if uploaded_files_meta:
                         email_body += "\n\nEvidence Files:\n"
