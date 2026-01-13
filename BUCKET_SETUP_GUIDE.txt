@@ -1,0 +1,74 @@
+"""
+MANUAL BUCKET CREATION - Step-by-Step Guide
+============================================
+
+You're getting a 403 error because the API key doesn't have permission to create buckets.
+We need to create the bucket manually through the Supabase Dashboard.
+
+STEP 1: Create the New Bucket
+------------------------------
+1. Open your browser and go to:
+   https://irvcekjiqfjbdifbpgas.supabase.co/project/_/storage/buckets
+
+2. Click the green "New bucket" button
+
+3. Fill in the form:
+   - Name: md-awards-storage
+   - Toggle "Public bucket" to ON (IMPORTANT!)
+   - Click "Create bucket"
+
+STEP 2: Set Storage Policies (Optional but Recommended)
+--------------------------------------------------------
+If you want to ensure anyone can read files:
+
+1. Go to:
+   https://irvcekjiqfjbdifbpgas.supabase.co/project/_/storage/policies
+
+2. Find the "md-awards-storage" bucket
+
+3. Click "New Policy"
+
+4. Choose "For full customization"
+
+5. Create a READ policy:
+   - Policy name: Public Read Access
+   - Allowed operation: SELECT
+   - Policy definition: (bucket_id = 'md-awards-storage')
+   - Click "Review" then "Save policy"
+
+6. Create an INSERT policy (for uploads):
+   - Policy name: Public Upload Access
+   - Allowed operation: INSERT
+   - Policy definition: (bucket_id = 'md-awards-storage')
+   - Click "Review" then "Save policy"
+
+STEP 3: Test the Bucket
+------------------------
+After creating the bucket, run:
+   python test_new_bucket.py
+
+STEP 4: Update Your Application
+--------------------------------
+If the test passes, update bsc.py:
+   Change line ~127 from:
+   bucket_name = "md-awards-files"
+   
+   To:
+   bucket_name = "md-awards-storage"
+
+TROUBLESHOOTING
+---------------
+If you still get 404 errors after creating the bucket:
+- Make sure "Public bucket" is toggled ON
+- Verify the bucket name is exactly "md-awards-storage"
+- Check that the policies are created correctly
+- Wait 1-2 minutes for changes to propagate
+
+Need help? Check if:
+1. The bucket appears in your dashboard
+2. The "Public" column shows "Yes" for your bucket
+3. You can manually upload a file through the dashboard
+"""
+
+if __name__ == "__main__":
+    print(__doc__)
